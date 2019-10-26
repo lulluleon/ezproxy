@@ -1,4 +1,4 @@
-"""Parse EZproxy logfile and export results into csv """
+"""Parse EZproxy logfile and export results into csv"""
 
 from urllib.parse import urlparse
 import urllib.request
