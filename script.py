@@ -1,83 +1,122 @@
-"""Parse EZproxy logfile and export results into csv"""
+"""Parse EZproxy logfile and export results into csv and MySQL"""
 
 from urllib.parse import urlparse, unquote_plus
 from crossref.restful import Works
 import glob
 import csv
 import re
-import sys
 import mysql.connector
 import datetime
 import time
 
-# Raw Log Files, check directory name
-inputfiles = glob.glob('data/ezp201924.log')
+# Raw Log Files ## check directory name
+inputfiles = glob.glob('data/1/*.txt')
 
 # using date/time format to create output file names
-date_string = str(datetime.date.today())  # '2017-12-26'
+date_string = str(datetime.date.today())  # 'yyyy-mm-dd'
 time_string = time.strftime("%H%M", time.localtime())
 outputfile = 'output/'+date_string+"-"+time_string+'.csv'
 
 # incomplete refurl tags causing error
 errortag = ['132.181.', 'app:', 'sogou', 'a:3:{s:2:', 'file:/']
-#  original script: 'app:', '(null)', "blank", "132.181", "file:", "6DAC0D5BDFC3D6CFEE151", "27D9F7D4CEBE234B32122", "6DAC0D5BDFC3D6CFEE202"
 
-# exclude staffip if necessary
+# exclude undesirabel IP Address ## include IP Address as a string, if required
 staffips = []
 
-on_campusips = ['132.181', '202.36.178', '202.36.179', ]  # IP range 132.181.*.*: oncampus wired, IP range 202.36.178.* , 202.36.179.*
+# IP range 132.181.*.*: oncampus wired, IP range 202.36.178.* , 202.36.179.*
+on_campusips = ['132.181', '202.36.178', '202.36.179', ]
 
 # if in list, try search patterns
-target_provider = ['springer', 'elsevier', 'sciencedirect', 'oxf', 'oed', 'oup', 'ebsco', 'jstor', 'hein', 'wiley', 'sage', 'proquest']
+target_provider = ['springer', 'elsevier', 'sciencedirect', 'oxf', 'oed', 'oup', 'ebsco', 'jstor', 'hein', 'wiley',
+                   'sage', 'proquest'] # able to remove when the project is expanded
 
-dbidentification_host = ['sk.sage', 'methods.sage', 'thecochranelibrary', 'ebookcentral.proquest', 'parlipapers.proquest', 'ulrichsweb.serialssolutions',
-                         'bbcjournalism', 'socialwork.oxfordre', 'opil.ouplaw', 'oxfordartonline', 'oxfordbibliographies',
-                         'classics.oxfordre', 'oxfordhandbooks', 'academic.oup', 'oaj.oxfordjournals', 'oxfordmusiconline', 'oed.com',
-                         'agupubs.onlinelibrary.wiley', '.onlinelibrary.wiley', 'birpublications.org']
+dbidentification_host = ['sk.sage', 'methods.sage', 'thecochranelibrary', 'ulrichsweb',
+                         'socialwork.oxfordre', 'oxfordartonline', 'oxfordbibliographies', 'oed.com',
+                         '.onlinelibrary.wiley', 'birpublications.org', 'oxfordmusiconline',
+                         'parlipapers', 'classics', 'bbcjournalism']
 
-dbidentification_path = ['/artbibliographies', 'professional/australianeducationindex', 'professional/scb', '/professional/', '/eebo', '/earthquake', '/eric',
-                         '/georef', '/georefinprocess', '/healthcomplete', '/lion', '/materialsienceengineering', '/pqdt', '/hnpnewyorktimes', '/ptsdpubs',
-                         '/sociologicalabstracts','/socabs', '/classics/', '/conference',  # proquest path indicator
-                         ]
+dbidentification_path = ['/artbibliographies', 'professional/australianeducationindex', 'professional/scb',
+                         '/professional/', '/eebo', '/earthquake', '/eric', '/georef', '/georefinprocess',
+                         '/healthcomplete', '/lion', '/materialsienceengineering', '/pqdt', '/hnpnewyorktimes',
+                         '/ptsdpubs', '/sociologicalabstracts','/socabs', '/classics/', '/socialwork', ]
 
-other_usage = ['/ehost/pdfviewer', '/eds/pdfviewer','/ehost/ebookviewer', '/EbscoViewerService/ebook', #ebscohost
-               'docview/'] # proquest
+dbidentification_query = ['db=', 'collection=', 'oso:', ]
 
-dbindentification_query = ['db=', 'collection=', 'oso:', 'journalCode=']
+other_usage = ['/ehost/pdfviewer', '/eds/pdfviewer','/ehost/ebookviewer/ebook', '/ehost/ebookViewer/ebook', # ebscohost non-db identifiable logs
+               '443/docview/', '433/pagepdf','/stable'] # proquest/jstor non-db identifiable logs with provideArticleId
 
-name_indicator = ['publication', 'loi', 'toc', 'journal', 'book', 'series', 'productKey', 'stable', 'topics', 'Book', 'reference', 'Reference', 'home', 'title', '10.1068',]
+
+name_indicator = ['publication', 'loi', 'toc', 'journal', 'book', 'series', 'productKey', 'stable', 'Book', 'reference',
+                  'Reference', 'title', 'pdf']
 
 issn_indicator = ['publication', 'loi', 'toc', 'issn', 'journal', '/', ]
 
-httpcode = [200, ]
+httpcode = [200, 302]
 
 
 # avoid strings
-geturl_astring = ['rl/exams', '/connect', 'gr2tq4rz9x', 'rss', 'maf/app', '/beacon', '/config', '/menu', '/logout', '/login', '/Login', '/api', '/_default', '/action/',
-                  '/font', '/cookies', '/ImportWidget', '/botdetectcaptcha', '/metadata/suggest', '/userimages', '/retrieve', '/checkout/cart',
-                  '/localization', '/truesightedgemarker', '/sdfe/arp', '/Authentication', '/ExternalImage', '/stat', '/css', 'volumesAndIssues/', 'wicket:', # springer auto-generated
-                  '/companylogo', '/signup-login', '/corporate-login', '/widget', '/change-location',
-                  '/redirect', '_ajax', '/metaproducts/','.progressivedisplay', #  proquest auto-generated
-                  '/topics/annotations', '/SSOCore', '/science/link', #  elsevier(sciencedirect) auto-generated
-                  '/record/pubMetDataAjax.uri', '/record/recordPageLinks.uri', '/record/references.uri', '/home.uri', '/redirect/linking.uri', '/cto2/getdetails.uri',#  scopus auto-generated
-                  '/HOL/Welcome', '/HOL/VMTPG', '/HOL/message', '/HOL/ajaxcalls', '/HOL/dummy', '/HOL/Citation', '/HOL/PL', '/HOL/P', '/HOL/QRCode', '/HOL/SearchVolumeSOLR',
-                  '/HOL/ViewImageLocal', '/HOL/insertBeta', '/HOL/PageDummy',  '/HOL/highlights', '/HOL/PDFsearchable', '/HOL/Print', '/HOL/ErrorCatch', '/HOL/NotSubscribed', '/HOL/NotAvailable', #  hein auto-generated logs
-                  '/data/Get', 'Data/Get', '/Data/Search', '/Data/Populate', '/Books/GetRelatedChapters', '/Books/ChapterMetadata', '/Books/Metadata', '/Books/BookContentTabs', '/Books/SearchChapters',
-                  '/Search/Get', '/MethodsMap/GetMethodsMapRef', 'bundles', '/embeddedvideo', '/search/advanced', #  sage auto-generated
-                  '/community/society-resources', '/sdfe/ears', '/readcube/log', '/ehost/result', '/track/controlled/', '/Messages.properties', '/audio',
-                  '.png', '.css', 'woff', '.svg', '.jpg', 'jpeg', '.gif', '.f4v', '.ico', 'json', '.swf', 'tiff', '.tff', '.js', 'woff2', '.txt', '.sml', ':ping',
-                  'bsigroup'] # should be included for complete DB
+geturl_astring = ['.png', '.css', 'woff', '.svg', '.jpg', 'jpeg', '.gif', '.f4v', '.ico', 'json', '.swf', 'tiff',
+                  '.tff', '.js', 'woff2', '.txt', '.sml', ':ping', '.ping',
+                  'rl/exams', '/connect', 'gr2tq4rz9x', 'rss', 'maf/app', '/beacon', '/config', '/menu', '/logout',
+                  '/login', '/Login', '/api', '/_default', '/action/', '/start', '/font', '/cookies', 'signup',
+                  'navigator', 'countryLookup', '/stat', '/css', '/ImportWidget', '/botdetectcaptcha',
+                  '/metadata/suggest', '/userimages', '/retrieve', '/checkout/cart', 'search/results', 'Search/Results',
+                  '/localization', '/truesightedgemarker', '/sdfe/arp', '/Authentication', '/ExternalImage',
+                  'volumesAndIssues/', 'wicket:', '/track/free', 'track/open', 'search?facet', 'citation-needed',
+                  'citations.','app-pp', # springer
+                  '/companylogo', '/signup-login', '/corporate-login', '/widget', '/change-location', '/usercss',
+                  'opensearchxml', 'view-large', 'crawlprevention', 'siteToSearch', 'savecitation','/cite/',
+                  'downloaddoclightbox','443/search','search-result','.layout','noresults','classics/search',
+                  'groveart/search', 'oedlogin','crossreferencepopup', 'browsedictionary','hiddenform',
+                  '/search/basic/hcppbasicsearch', '/grovemusic/browse', 'grovemusic/search',
+                  '/result/pqpdocumentview:imgLinkUri','/result/pqpdocumentview:genericAjax',
+                  'updatepreference','dictionarywordwheel', 'current/cover','academic/covers','system/images',
+                  'result/pqpresultpage.gispdfhitspanel', 'result/pqpresultpage',#oxford
+                  '/redirect', '_ajax', '/metaproducts/','.progressivedisplay','/citation', 'citeThisZone', '/results/',
+                  'logrecommenderfeedback', 'index?accountid','advanced?accountid','sessionexpired', '/advanced/',
+                  'citedreference','citedby','pdfdoctoolssection', 'expandedbasicsearchbox','markedlistcheckbox',# proquest
+                  '/topics/','/SSOCore', '/science/link', 'export-citations', 'service.elsevier','_rest_magic/',
+                  'smetrics.elsevier', '/record/pubMetDataAjax', '/onclick/', 'record/pubmetrics.uri', '/alert/',
+                  'record/pubmetrixCitationsAjax.uri','/authid/','/sourceid/', '/source/',  # elsevier(sciencedirect/scopus)
+                  '/HOL/Welcome', '/HOL/VMTPG', '/HOL/message', '/HOL/ajaxcalls', '/HOL/dummy', '/HOL/Citation',
+                  '/HOL/PL', '/HOL/QRCode', '/HOL/SearchVolumeSOLR', '/LuceneSearch', '/HOL/ViewImageLocal',
+                  '/HOL/insertBeta', '/HOL/PageDummy',  '/HOL/highlights', 'HOL/Index', '/SearchHistory',
+                  '/SearchBuilder', '/HOL/ErrorCatch', '/HOL/NotSubscribed', '/HOL/NotAvailable', '/HOL/MarcXMLData',
+                  'OneBoxCitation', 'SearchVolumeLucene', #  hein auto-generated logs
+                  '/data/Get', 'Data/Get', '/Data/Search', '/Data/Populate', '/Books/GetRelatedChapters',
+                  '/Books/ChapterMetadata', '/Books/Metadata', '/Books/BookContentTabs', '/Books/SearchChapters',
+                  '/Search/Get', '/MethodsMap/GetMethodsMapRef', 'bundles', '/embeddedvideo', '/search/advanced',
+                  ':80/search','reader/search', 'ExportCitation', 'CitationExport', 'reading-lists','BrowseMethods',
+                  'data/LogVideoView', # sage
+                  '/community/society-resources', '/sdfe/ears', '/readcube/log', '/ehost/result', '/track/controlled/',
+                  '/Messages.properties', '/audio', '/GetIllustrations', '/GetResultListToc','CheckoutDialog',
+                  '/LoadRecord', 'community.aspx','ehost/search', 'eds/results','addremovefolderitem','exportpanel',
+                  'detail/imageQuickView', 'detail/detail', 'ehost/delivery','ehost/ebookdelivery', #ebsco
+                  'bsigroup', 'oxcon.ouplaw', 'go.galegroup', 'safaribooks'] # keywords in this line should be included for complete DB analysis
+
+non_dbCode = ['support', 'page', 'missing', 'products', 'book', 'app', 'moniker', 'na101', 'image', 'all']
+
+non_title = ['a:', 'j.', 'j', 'bl', 'bf', '(issn)', '(sici)', 'B:', 'b:', 'acref', 'acprof', 'acprof:oso', 'oso',
+             'pb', 'pl', 'issue', 'ThirdParty', 'Services', 'Citation', 'OUPMyAccount', 'EPIL', 'ORIL', 'MPECCOL',
+             'supporthub', 'download', 'law:', '+', ':', '/', 'None'] # exclude from sTitleName
+
+doiProvider = ['PRVAVX', 'PRVWIB', 'PRVSPB', 'PRVASL']
+
+titleIdProvider = ['PRVAVX', 'PRVPQU', 'PRVJST']
+
+jstor = ['jstor.org', 'jstororg' ]
 
 # column names
 fieldnames = ['ipAddress', 'userName', 'onCampus', 'dateTime', 'getUrl', 'getHost', 'getPath', 'getQuery', 'category',
-              'providerCode', 'dbHost', 'dbCode', 'year', 'issn', 'isbn', 'uniqueIdentifier', 'sTitleName', 'providerTitleId', 'doi', 'pii', 'unidentifiable',
-              'httpStatus', 'refUrl', 'refHost',]
+              'providerCode', 'dbHost', 'dbCode', 'year', 'issn', 'isbn', 'uniqueIdentifier', 'sTitleName',
+              'providerTitleId', 'providerArticleId', 'doi', 'pii', 'httpStatus', 'refUrl', 'refHost',]
+
 
 # open outputfile to write to
 with open(outputfile, 'w', newline='', encoding="utf-8") as outputs:
     wr = csv.DictWriter(outputs, fieldnames=fieldnames)
     wr.writeheader()
-    print('EZproxy analysis beginning... This may take a few minutes.\n')  # check if csv file created
+    print('EZproxy analysis beginning... This may take a few minutes.\n')  # check if output csv file created
 
 # read each raw log file
     for inputfile in inputfiles:
@@ -124,7 +163,7 @@ with open(outputfile, 'w', newline='', encoding="utf-8") as outputs:
                 gquery = p_geturl.query
                 resultdict["getQuery"] = gquery
 
-                ## find provider
+                ## allocate providerName by string
                 if 'springer' in ghost:
                     resultdict["providerCode"] = 'PRVAVX'
                 elif 'elsevier' in ghost:
@@ -154,32 +193,65 @@ with open(outputfile, 'w', newline='', encoding="utf-8") as outputs:
                 else:
                     resultdict["providerCode"] = None
 
-                        ## find db indicator
-                # with hostname (sage, oxford, some wiley & proQuest)
+
+                ## find db indicator
+                # parse hostname (sage, oxford, wiley & proQuest)
                 if any(x in ghost for x in dbidentification_host):
                     resultdict["dbHost"] = ghost
+                    if resultdict["dbHost"] == "www.onlinelibrary.wiley.com":
+                        resultdict["dbHost"] = None
+                    elif resultdict["dbHost"] == "public.oed.com":
+                        resultdict["dbHost"] = None
+                    else:
+                        pass
                 else:
                     resultdict["dbHost"] = None
 
-                # with dbcode (ebscohost, hein, proQuest)
+                # parse dbcode (ebscohost, hein, proQuest)
                 if any(x in gpath for x in dbidentification_path):
-                    dbcode1 = re.search(r'(/)(\w*)', gpath).group(2)
+                    dbcode1 = re.search(r'(profiles/|/)(\w*)', gpath).group(2)
                     resultdict["dbCode"] = dbcode1
-                elif any(x in gquery for x in dbindentification_query):
+                elif any(x in gquery for x in dbidentification_query):
                     try:
-                        dbcode2 = re.search(r'(db=|collection=|journalCode=|oso:)(\w*)(/|)', gquery).group(2)
+                        dbcode2 = re.search(r'(db=|collection=|oso:)(\w*)(/|)', gquery).group(2)
                         resultdict["dbCode"] = dbcode2
                     except AttributeError:
                         resultdict["dbCode"] = None
                 elif "eid=2-s" in gquery:
-                    resultdict["dbCode"] = "SCOPUS"
+                    resultdict["dbCode"] = "scopus"
+                elif "proquest" in ghost:
+                    try:
+                        dbcode3 = re.search(r'(\w*)(/docview/|/pagepdf/)', gpath).group(1)
+                        dbcode3 = dbcode3.replace('/', '')
+                        resultdict["dbCode"] = dbcode3
+                    except AttributeError:
+                        resultdict["dbCode"] = None
                 else:
                     resultdict["dbCode"] = None
 
-                # with journalname(shortname included) or providerId(springer, proQuest)
+                # remove if a string is undesirable for the field
+                for i in range(0, len(non_dbCode)):
+                    if resultdict["dbCode"] == non_dbCode[i]:
+                        resultdict["dbCode"] = None
+
+                # mark if logs are disable to identify db
+                if any(x in u_geturl for x in other_usage):
+                    if resultdict["providerCode"] == 'PRVEBS':
+                        resultdict["dbCode"] = "XXXEBS"
+                    elif resultdict["providerCode"] == 'PRVPQU':
+                        resultdict["dbCode"] = "NXXPQU"
+                    elif resultdict["providerCode"] == 'PRVJST':
+                        resultdict["dbCode"] = "NXXJST"
+                    else:
+                        resultdict["dbCode"] = None
+                else:
+                    pass
+
+                # parse title name(short title name) or providerId(springer, proQuest)
                 if any(x in gpath for x in name_indicator):
                     try:
-                        journal1 = re.search(r'(/loi/|/toc/|\.journals/|/journal/|/book/|/books/|/Book/|/reference/|/Reference//|/home/|/topics/)(\D{2,}\d*)(/|\?|)', gpath).group(2)
+                        journal1 = re.search(r'(/loi/|/toc/|\.journals/|/journal/|/book/|/books/|/Book/'
+                                             r'|/reference/|/Reference//)(\D{2,}\d*)(/|\?|)', gpath).group(2)
                         journal1 = journal1.replace('-', '')
                         try:
                             journal1=journal1.split('/')[0]
@@ -188,12 +260,12 @@ with open(outputfile, 'w', newline='', encoding="utf-8") as outputs:
                             resultdict["sTitleName"] = journal1
                     except AttributeError:
                         resultdict["sTitleName"] = None
+                elif 'journalCode=' in gquery:
                     try:
-                        journal3 = re.search(r'(10.1068/|10.3141/|10.1037/|10.2190/|10.1023/)(\w*)', gpath).group()  ## exceptional doi format: directly allocate db by doi
-                        resultdict["sTitleName"] = journal3
-                    except:
-                        pass
-
+                        journal4 = re.search(r'(journalCode=)(\w{3})', gquery).group(2)
+                        resultdict["sTitleName"] = journal4
+                    except AttributeError:
+                        resultdict["sTitleName"] = None
                 elif 'title' in gquery:
                     try:
                         journal2 = re.search (r'(title=)(\D{2,}|\D{2,}\d*)(&date)', gquery).group(2)
@@ -202,31 +274,47 @@ with open(outputfile, 'w', newline='', encoding="utf-8") as outputs:
                         resultdict["sTitleName"] = journal2
                     except AttributeError:
                         resultdict["sTitleName"] = None
+
+                elif 'academic.oup.com' in ghost:
+                    try:
+                        journal3 = re.search(r'(/\w*)(/article/|/article-abstract/|/issue/|/)', gpath).group(1)
+                        journal3 = journal3.replace('/', '')
+                        resultdict["sTitleName"] = journal3
+                    except AttributeError:
+                        resultdict["sTitleName"] = None
                 else:
                     resultdict["sTitleName"] = None
 
-                if any(x in gpath for x in name_indicator):
-                    try:
-                        providerid1 = re.search(r'(/bookseries/|/series/|productKey=|/journal/|/stable/pdf/|/stable/|publication/|publications|theBookId=)(\d{1,7}\b)', gpath).group(2)
-                        if 'hein' in ghost:
-                            resultdict["providerTitleId"] = None
-                        else:
+                if any(x in str(resultdict["providerCode"]) for x in titleIdProvider):
+                    if any(x in gpath for x in name_indicator):
+                        try:
+                            providerid1 = re.search(r'(productKey=|/journal/|/stable/pdf/|/pagepdf/|/stable/'
+                                                    r'|t:ac=|publication/|publications|theBookId=)(\d{1,}\b)', gpath).group(2)
                             resultdict["providerTitleId"] = providerid1
-                    except AttributeError:
+                        except AttributeError:
+                            resultdict["providerTitleId"] = None
+                    elif any(x in gquery for x in name_indicator):
+                        try:
+                            providerid2 = re.search(r'(productKey=|theBookId=|t:ac=)(\d{1,})', gquery).group(2)
+                            resultdict["providerTitleId"] = providerid2
+                        except AttributeError:
+                            resultdict["providerTitleId"] = None
+                    else:
                         resultdict["providerTitleId"] = None
-                elif any(x in gquery for x in name_indicator):
-                    try:
-                        providerid2 = re.search(r'(productKey=|theBookId=)(\d{1,7})', gquery).group(2)
-                        resultdict["providerTitleId"] = providerid2
-                    except AttributeError:
-                        resultdict["providerTitleId"] = None
-                else:
-                    resultdict["providerTitleId"] = None
 
-                # with isbn (most ebooks)
+                if 'PRVPQU' in str(resultdict["providerCode"]):
+                    try:
+                        providerid3 = re.search(r'(docview/)(\d{1,}\b)',gpath).group(2)
+                        resultdict["providerArticleId"] = providerid3
+                    except AttributeError:
+                        resultdict["providerArticleId"] = None
+
+
+                # parse isbn
                 if '978' in u_geturl:
                     try:
-                        isbn1 = re.search(r'(978)-(\d*)-(\d*)-(\d*)-(\d*)|(978)-(\d*)-(\d*)-(\d*)|(978)(\d{10})', u_geturl).group()
+                        isbn1 = re.search(r'(978)-(\d*)-(\d*)-(\d*)-(\d*)'
+                                          r'|(978)-(\d*)-(\d*)-(\d*)|(978)(\d{10})', u_geturl).group()
                         try:
                             isbn1 = isbn1.replace('-', '')
                             resultdict["isbn"] = isbn1
@@ -234,15 +322,22 @@ with open(outputfile, 'w', newline='', encoding="utf-8") as outputs:
                             resultdict["isbn"] = isbn1
                     except AttributeError:
                         resultdict["isbn"] = None
+                else:
+                    resultdict["isbn"] = None
 
-                # with issn - need to look up from other dataset (e.g. titlelist)
-                elif any(x in u_geturl for x in issn_indicator):
+                # parse issn
+                if any(x in u_geturl for x in issn_indicator):
                     try:
-                        issn1 = re.search(r'(/publication/|publication=|/loi/|/loi/S|/loi/s|/toc/|/toc/S|/toc/s|issn\.|issn/|issn=|journal:|/journal/|/\w*/\w*/\d*/\d*/\d*/|/)(\d{4}-\w*|\d{8}\b|\d{6}\w{2}\b)', u_geturl).group(2)
+                        issn1 = re.search(r'(/publication/|publication=|/loi/|/loi/S|/loi/s|/toc/|/toc/S|/toc/s'
+                                          r'|issn\.|issn/|issn=|journal:|/journal/|/\w*/\w*/\d*/\d*/\d*/|/)(\d{4}-\w*'
+                                          r'|\d{8}\b|\d{6}\w{2}\b|\d{8}\w{1})', u_geturl).group(2)
                         issn1 = issn1.replace('-', '')
+                        issn1 = issn1.replace('a', '')
+                        issn1 = issn1.replace('b', '')
+                        issn1 = issn1.replace('c', '')
                         if re.search(r'(978[0-9]{5})', issn1) != None:
                             resultdict["issn"] = None
-                        elif "/docview" in gpath:
+                        elif "proquest" in geturl:
                             resultdict["issn"] = None
                         else:
                             resultdict["issn"] = issn1
@@ -251,35 +346,27 @@ with open(outputfile, 'w', newline='', encoding="utf-8") as outputs:
                 else:
                     resultdict["issn"] = None
 
-                #  with doi - need to look up from other dataset
+                # parse doi
                 if '10.' in u_geturl:
                     try:
-                        doi1 = re.search(r'(10\.)(\d*/)(\w*\.)(\w*\.)(\d*\.)(\d*\.)(\w*)|(10\.)(\d*/)(\w*\.)(\w*\.)(\d*\.)(\w*)|'
-                                         r'(10\.)(\d*/)(\w*\.)(\w*\.)(\w*)|(10\.)(\d*/)(\(\w*\))(\d*)-(\d*)|(10\.)(\d*/)(\w*:)(\w*)|(10\.)(\d*/)(\w*)-(\d*)-(\d*)-(\d*)-(\w*)|'
-                                         r'(10\.)(\d*/)(\w*)-(\d*)-(\d*)-(\w*)|(10\.)(\d*/)(\w*\.)(\w*)-(\w*)-(\d*)-(\w*)|'
-                                         r'(10\.)(\d*/)(\w*\.)(\w*)-(\w*)|(10\.)(\d*/)(\w*\.)(\w*)|(10\.)(\d*/)(\w*)-(\w*)|(10\.)(\d*/)-(\w*)|'
-                                         r'(10\.)(\d*/)(\w*)|(10\.)(\d*%2F)(\w*)-(\d*)-(\d*)-(\w*)|(10\.)(\d*%2F)(\w*)'
+                        doi1 = re.search(r'(10\.)(\d*/)(\w*\.)(\w*\.)(\w*\.)(\w*\.)(\w*)'
+                                         r'|(10\.)(\d*/)(\w*\.)(\w*\.)(\w*\.)(\w*)|'
+                                         r'(10\.)(\d*/)(\w*\.)(\w*\.)(\w*)|(10\.)(\d*/)(\(\w*\))(\d*)-(\d{4})'
+                                         r'|(10\.)(\d*/)(\(\w*\))(\d*)-(\w*)|'
+                                         r'(10\.)(\d*/)(\w*:\W*/)(\w*)|(10\.)(\d*/)(\w*:)(\w*)'
+                                         r'|(10\.)(\d*/)(\w*)-(\w*)-(\w*)-(\w*)-(\w*)|'
+                                         r'(10\.)(\d*/)(\w*)-(\w*)-(\w*)-(\w*)|(10\.)(\d*/)(\w*\.)(\w*)-(\w*)-(\w*)-(\w*)|'
+                                         r'(10\.)(\d*/)(\w*\.)(\w*)-(\w*)|(10\.)(\d*/)(\w*\.)(\w*)'
+                                         r'|(10\.)(\d*/)(\w*)-(\w*)|(10\.)(\d*/)(\w*/)(\w*)|(10\.)(\d*/)(\w*)(\(\w*\))(\w*)|'
+                                         r'(10\.)(\d*/)(\w*)|(10\.)(\d*%2F)(\w*)-(\w*)-(\w*)-(\w*)|(10\.)(\d*%2F)(\w*)'
                                          , u_geturl).group()
                         resultdict["doi"] = doi1
+                        doi1 = doi1.replace('.pdf', '')
                         doi2 = doi1.replace('-', '')
-                        """ # doi by api (too slow)
-                        works = Works()
-                        instance = works.doi(doi2)
-                        if re.search(r'(/978)', doi2) != None:
-                            try:
-                                resultdict ["year"] = instance.get('created', {}).get('date-parts')[0][0]
-                            except AttributeError:
-                                resultdict["year"] = 9999
-                        else:
-                            try:
-                                resultdict["year"] = instance.get('created', {}).get('date-parts')[0][0]
-                                resultdict["uniqueIdentifier"] = instance.get('ISSN')[0].replace('-','')
-                            except AttributeError:
-                                resultdict["year"] = 9999
-                                resultdict["uniqueIdentifier"] = None
-                        """
+
+
                         try:
-                            issn2 = re.search(r'(j\.|/s|/S|BF|PL|/|[)])(\d{8}|\d{7}\w{1})', doi2).group(2)
+                            issn2 = re.search(r'(J\.|j\.|/|[)])(\b\d{8}\b|\d{7}\w{1}\b)', doi2).group(2)
                             if re.search(r'(978[0-9]{5})', issn2) != None:
                                 resultdict["issn"] = None
                             else:
@@ -298,12 +385,13 @@ with open(outputfile, 'w', newline='', encoding="utf-8") as outputs:
                                 resultdict["year"] = 9999
                         except:
                             resultdict["sTitleName"] = None
+
                     except AttributeError:
                         resultdict["doi"] = None
                 else:
                     resultdict["doi"] = None
 
-                # with pii(sicence direct, elsevier) - need to look up
+                # parse pii
                 if 'pii' in u_geturl:
                     try:
                         pii1 = re.search(r'(pii/|pii=)(\w*-\w\(\w\)\w-\w|\w*)', u_geturl).group(2)
@@ -322,79 +410,176 @@ with open(outputfile, 'w', newline='', encoding="utf-8") as outputs:
                 else:
                     resultdict["pii"] = None
 
-                resultdict["uniqueIdentifier"] = (str(resultdict["issn"])+str(resultdict["isbn"])).replace("None",'')
 
-
-                if any(x in gpath for x in other_usage):
-                    resultdict["unidentifiable"] = 1
-                else:
-                    resultdict["unidentifiable"] = None
-
-                # find if published year exists
+                # find if published year exists, otherwise allocate '9999'
                 try:
                     year = re.search(r'(year=|year/|DT "|date=)([1-2][0-9]{3})', u_geturl).group(2)
                     resultdict["year"] = year
                 except:
                     resultdict["year"] = 9999  # year unidentifiable
 
-                httpreturncode = elements[8]
-                resultdict["httpStatus"] = httpreturncode
+                # httpreturn code and convert http status code into int
+                try:
+                    httpreturncode = elements[8]
+                    resultdict["httpStatus"] = httpreturncode
+                    try:
+                        httpreturncode_int = int(httpreturncode)
+                    except:
+                        httpreturncode_int = 399
+                except IndexError:
+                    pass
+
+
 
                 ## parse referring url
-                if any(x in elements[10] for x in errortag):
-                    print("problematic text")  # cause error if in url (e.g. non-string/blank)
-                else:
-                    u_refurl = unquote_plus(elements[10].strip('"'))  # convert into unicode strings if non-problematictext
-                    p_refurl = urlparse(u_refurl)
-                    u_refurl = u_refurl.replace('-', '')
-                    resultdict["refUrl"] = u_refurl.rstrip()
-
-                    # parse referring url's host: to identify accessed from where
-                    try:
-                        unescaped_ref_host = p_refurl.hostname.replace('.ezproxy.canterbury.ac.nz', '') # remove data doesn't contribute
-                    except:
-                        unescaped_ref_host = p_refurl.hostname
-                    resultdict["refHost"] = unescaped_ref_host
-
-                # convert http status code into int
                 try:
-                    httpreturncode_int = int(httpreturncode)
-                except:
-                    httpreturncode_int = 399
+
+                    if any(x in elements[10] for x in errortag):
+                        print("problematic text")  # cause error if in url (e.g. non-string/blank)
+                    else:
+                        refurl = elements[10].strip('"')  # full requesting url
+                        u_refurl = unquote_plus(refurl) # convert into unicode strings if non-problematictext
+                        u_refurl = u_refurl.replace("-", "")
+                        p_refurl = urlparse(u_refurl)
+                        resultdict["refUrl"] = u_refurl
+
+                        try:
+                            unescaped_ref_host = p_refurl.hostname.replace('.ezproxy.canterbury.ac.nz', '') # remove data doesn't contribute
+                        except:
+                            unescaped_ref_host = p_refurl.hostname
+                            resultdict["refHost"] = unescaped_ref_host
+                except IndexError:
+                    pass
+
+                # JSTOR usage only appear in refURL
+                if any (x in refurl for x in jstor):
+                    resultdict["providerCode"] = 'PRVJST'
+                    try:
+                        providerArticleId1 = re.search(r'(stable/|stable%2f)(\d{1,})', refurl).group(2)
+                        resultdict["providerArticleId"] = providerArticleId1
+                    except AttributeError:
+                        pass
+                    try:
+                        providerTitleId1 = re.search(r'(stable/resrep/|stable%2fresrep)(\d{1,8})', refurl).group(2)
+                        resultdict["providerTitleId"] = providerTitleId1
+                    except AttributeError:
+                        pass
+                    try:
+                        doi3 = re.search(r'(10\.)(\d*/)(\w*)|(10\.)(\d*%2F)(\w*)', refurl).group()
+                        resultdict["doi"] = doi3
+                    except AttributeError:
+                        pass
+                    try:
+                        issn4 = re.search(r'(issn=)(\d{4}-\w*|\d{8}\b|\d{6}\w{2}\b|\d{8}\w{1})', refurl).group(2)
+                        issn4 = issn4.replace('-', '')
+                        resultdict["issn"] = issn4
+                    except AttributeError:
+                        pass
+                    try:
+                        sTitleName1 = re.search(r'(journal/)(\w*)', refurl).group(2)
+                        resultdict["sTitleName"] = sTitleName1
+                    except AttributeError:
+                        pass
+                else:
+                    pass
+
+
+                # combine issn and isbn as unique identifier
+                resultdict["uniqueIdentifier"] = (str(resultdict["issn"])+str(resultdict["isbn"])).replace("None", "").lstrip("0")
+
+
+                # standardising sTitleName
+
+                # remove if a string is undesirable for the field
+                for i in range(0, len(non_title)):
+                    if any(x in str(resultdict["sTitleName"]) for x in non_title[i]):
+                        try:
+                           resultdict["sTitleName"] = str(resultdict["sTitleName"]).replace(non_title[i], "")
+                        except AttributeError:
+                            pass
+                    else:
+                        pass
+
+                if ((resultdict["providerCode"] == "PRVSPB") and resultdict["sTitleName"] != None):
+                    if (len(resultdict["sTitleName"]) == 4):
+                        try:
+                            sTitleName2 = str(resultdict["sTitleName"])[:-1]
+                            resultdict["sTitleName"] = sTitleName2
+                        except TypeError:
+                            pass
+                    else:
+                        pass
+                else:
+                    pass
+
+
+                # find ISSN/ISBN through DOI
+                if resultdict["doi"] != None:
+                    try:
+                        resultdict["doi"] =str(resultdict["doi"]).replace(".pdf", "")
+                        # doi by api, slow / a separated script is also created
+                        if any(x in str(resultdict["providerCode"]) for x in doiProvider):
+                            if re.search(r'(/978)', doi1) != None:
+                                resultdict["year"] = 9999
+                            else:
+                                works = Works()
+                                instance = works.doi(doi1)
+                                try:
+                                    resultdict["year"] = instance.get('created', {}).get('date-parts')[0][0]
+                                    resultdict["issn"] = instance.get('ISSN')[0].replace('-', '')
+                                except TypeError:
+                                    try:
+                                        resultdict["year"] = instance.get('created', {}).get('date-parts')[0][0]
+                                        resultdict["isbn"] = instance.get('ISBN')[0].replace('-', '')
+                                    except AttributeError:
+                                        resultdict["year"] = 9999
+                                        resultdict["issn"] = None
+                                except AttributeError:
+                                    resultdict["year"] = 9999
+                                    resultdict["issn"] = None
+                        else:
+                            pass
+                    except AttributeError:
+                        pass
+                else:
+                    pass
+
+
+                # convert empty string to null value
+                for i in range(0, len(fieldnames)):
+                    if resultdict[(fieldnames[i])] == "":
+                        resultdict[(fieldnames[i])] = None
 
                 ## check if a record is a unique action & db identifiable
-                if resultdict["dbHost"] != None:
-                    resultdict["category"] = 1
-                elif resultdict ["dbCode"] != None:
-                    resultdict["category"] = 2
-                elif resultdict["issn"] != None:
-                    resultdict["category"] = 3
-                elif resultdict["isbn"] != None:
-                    resultdict["category"] = 3
-                elif resultdict["providerTitleId"] != None:
-                    resultdict["category"] = 4
-                elif resultdict["sTitleName"] != None:
-                    resultdict["category"] = 5
-                elif resultdict["doi"] != None:
-                    resultdict["category"] = 6
-                elif resultdict["pii"] != None:
-                    resultdict["category"] = 6
-                elif resultdict["unidentifiable"] != None:
-                    resultdict["category"] = 7
+                if resultdict["providerCode"] != None:
+                    if resultdict["dbHost"] !=None:
+                        if gpath != "/":
+                            resultdict["category"] = 1
+                        else:
+                            resultdict["category"] = 0
+                    elif resultdict["dbCode"] or resultdict["uniqueIdentifier"] or resultdict["sTitleName"] \
+                            or resultdict["providerTitleId"] or resultdict["doi"] or resultdict["pii"]!= None:
+                        resultdict["category"] = 1
+                    else:
+                        resultdict["category"] = 0
                 else:
                     resultdict["category"] = 0
 
+
                 ## data removing
-                writeout_line = writeout_code = writeout_ip = writeout_path = writeout_geturl = writeout_check = True
+                writeout_code = writeout_ip = writeout_geturl = True
 
-                if any(x in geturl for x in target_provider):  # for research purpose, should be removed when the project is further expanded
-                    pass
-                else:
-                    writeout_line = False
 
-                # exclude from scv file if http return code is 200. 2xx or 3xx ends up with 200. Error related code are also removed(4xx - 9xx).
+                # exclude from scv file if http return code is 200. 2xx or 3xx ends up with 200.
+                # Error related code are also removed(4xx - 9xx).
                 if httpreturncode_int in httpcode:
-                    pass
+                    if resultdict["providerCode"] != "PRVJST":
+                        if httpreturncode_int != 200:
+                            writeout_code = False
+                        elif "login":
+                            pass
+                    else:
+                        pass
                 else:
                     writeout_code = False
 
@@ -404,46 +589,47 @@ with open(outputfile, 'w', newline='', encoding="utf-8") as outputs:
 
                 # exclude geturl/refurl with any undesirable string
                 if any(x in u_geturl for x in geturl_astring):
-                    writeout_geturl = False
-                    print(linenumber, "as_geturl")
+                    if resultdict["providerCode"] != "PRVJST":
+                        writeout_geturl = False
+                    else:
+                        pass
+                else:
+                    pass
+                    # print(linenumber, "as_geturl")
 
                 # show result and write in dictionary to be exported as csv
-                if writeout_line and writeout_code and writeout_ip and writeout_path and writeout_geturl and writeout_check:
+                if writeout_code and writeout_ip and writeout_geturl:
                     print(resultdict)
                     wr.writerow(resultdict)
 
-
-                    if resultdict["providerCode"] == 'PRVESC':
+                    if resultdict["category"] > 0:
                         #  insert into DB
-                        """
+
                         db = mysql.connector.connect(
-                            host="132.181.143.31",
-                            database="UC_Lib_EZproxy_sandbox",
-                            user="ywy16",
-                            password="Princeps4464!",
+                            host="[hostname]",
+                            database="[databasename]",
+                            user="[username]",
+                            password="[password]",
                             auth_plugin="mysql_native_password")
-                        """
-                        db = mysql.connector.connect(
-                            host="localhost",
-                            database="UC_Lib_EZproxy_sandbox",
-                            user="root",
-                            password="Princeps4464!")
 
                         print(db)
 
                         db_cursor = db.cursor()
-                        qry = "INSERT INTO ezproxyLogs (ipAddress, dateTime, userName, providerCode, comUrl, year, dbHost, dbCode, uniqueIdentifier, providerTitleId, sTitleName, refUrl) " \
-                              "VALUES (%(ipAddress)s, %(dateTime)s, %(userName)s, %(providerCode)s, %(getUrl)s, %(year)s, %(dbHost)s, %(dbCode)s, %(uniqueIdentifier)s, %(providerTitleId)s, %(sTitleName)s, %(refUrl)s)"
+                        qry = "INSERT INTO ezproxyLogs2 (ipAddress, dateTime, userName, onCampus, providerCode, comUrl, " \
+                              "year, dbHost, dbCode, uniqueIdentifier, providerTitleId, providerArticleId, sTitleName, " \
+                              "doi, pii, refUrl) " \
+                              "VALUES (%(ipAddress)s, %(dateTime)s, %(userName)s, %(onCampus)s, %(providerCode)s, " \
+                              "%(getUrl)s, %(year)s, %(dbHost)s, %(dbCode)s, %(uniqueIdentifier)s, %(providerTitleId)s, " \
+                              "%(providerArticleId)s, %(sTitleName)s, %(doi)s, %(pii)s, %(refUrl)s)"
 
                         try:
                             db_cursor.execute(qry, resultdict)
                             db.commit()
-                            print("new entry")
+                            print(linenumber, "new entry")
 
                         except mysql.connector.errors.IntegrityError:
                             pass
                         except mysql.connector.errors.DatabaseError:
                             pass
-
 
                 linenumber += 1
